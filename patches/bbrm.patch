@@ -1,52 +1,51 @@
 diff -uprN linux-6.9.9/net/ipv4/Kconfig linux-6.9.9-mod/net/ipv4/Kconfig
 --- linux-6.9.9/net/ipv4/Kconfig	2024-07-11 03:51:24.000000000 -0700
-+++ linux-6.9.9-mod/net/ipv4/Kconfig	2024-07-18 09:58:59.946163774 -0700
-@@ -493,6 +493,12 @@ config TCP_CONG_BIC
- 	  increase provides TCP friendliness.
- 	  See http://www.csc.ncsu.edu/faculty/rhee/export/bitcp/
++++ linux-6.9.9-mod/net/ipv4/Kconfig	2024-07-18 11:15:54.788316404 -0700
+@@ -503,7 +503,7 @@ config TCP_CONG_CUBIC
  
-+config TCP_CONG_BBRM
-+    tristate "TCP BBRM"
-+    default y
-+    help
-+      Modified BBR
-+
- config TCP_CONG_CUBIC
- 	tristate "CUBIC TCP"
- 	default y
-diff -uprN linux-6.9.9/net/ipv4/Makefile linux-6.9.9-mod/net/ipv4/Makefile
---- linux-6.9.9/net/ipv4/Makefile	2024-07-11 03:51:24.000000000 -0700
-+++ linux-6.9.9-mod/net/ipv4/Makefile	2024-07-18 09:58:59.946163774 -0700
-@@ -48,6 +48,7 @@ obj-$(CONFIG_TCP_CONG_BBR) += tcp_bbr.o
- obj-$(CONFIG_TCP_CONG_BIC) += tcp_bic.o
- obj-$(CONFIG_TCP_CONG_CDG) += tcp_cdg.o
- obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
-+obj-$(CONFIG_TCP_CONG_BBRM) += tcp_bbrm.o
- obj-$(CONFIG_TCP_CONG_DCTCP) += tcp_dctcp.o
- obj-$(CONFIG_TCP_CONG_WESTWOOD) += tcp_westwood.o
- obj-$(CONFIG_TCP_CONG_HSTCP) += tcp_highspeed.o
-diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
---- linux-6.9.9/net/ipv4/tcp_bbrm.c	1969-12-31 16:00:00.000000000 -0800
-+++ linux-6.9.9-mod/net/ipv4/tcp_bbrm.c	2024-07-18 10:25:41.050390425 -0700
-@@ -0,0 +1,1217 @@
+ config TCP_CONG_WESTWOOD
+ 	tristate "TCP Westwood+"
+-	default m
++	default y
+ 	help
+ 	  TCP Westwood+ is a sender-side only modification of the TCP Reno
+ 	  protocol stack that optimizes the performance of TCP congestion
+diff -uprN linux-6.9.9/net/ipv4/tcp_westwood.c linux-6.9.9-mod/net/ipv4/tcp_westwood.c
+--- linux-6.9.9/net/ipv4/tcp_westwood.c	2024-07-11 03:51:24.000000000 -0700
++++ linux-6.9.9-mod/net/ipv4/tcp_westwood.c	2024-07-18 11:18:56.875754631 -0700
+@@ -1,309 +1,1217 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * TCP Westwood+: end-to-end bandwidth estimation for TCP
 +/* Bottleneck Bandwidth and RTT (BBR) congestion control
-+ *
+  *
+- *      Angelo Dell'Aera: author of the first version of TCP Westwood+ in Linux 2.4
 + * BBR congestion control computes the sending rate based on the delivery
 + * rate (throughput) estimated from ACKs. In a nutshell:
-+ *
+  *
+- * Support at http://c3lab.poliba.it/index.php/Westwood
+- * Main references in literature:
 + *   On each ACK, update our model of the network path:
 + *      bottleneck_bandwidth = windowed_max(delivered / elapsed, 10 round trips)
 + *      min_rtt = windowed_min(rtt, 10 seconds)
 + *   pacing_rate = pacing_gain * bottleneck_bandwidth
 + *   cwnd = max(cwnd_gain * bottleneck_bandwidth * min_rtt, 4)
-+ *
+  *
+- * - Mascolo S, Casetti, M. Gerla et al.
+- *   "TCP Westwood: bandwidth estimation for TCP" Proc. ACM Mobicom 2001
 + * The core algorithm does not react directly to packet losses or delays,
 + * although BBR may adjust the size of next send per ACK when loss is
 + * observed, or adjust the sending rate if it estimates there is a
 + * traffic policer, in order to keep the drop rate reasonable.
-+ *
+  *
+- * - A. Grieco, s. Mascolo
+- *   "Performance evaluation of New Reno, Vegas, Westwood+ TCP" ACM Computer
+- *     Comm. Review, 2004
 + * Here is a state transition diagram for BBR:
-+ *
+  *
+- * - A. Dell'Aera, L. Grieco, S. Mascolo.
+- *   "Linux 2.4 Implementation of Westwood+ TCP with Rate-Halving :
+- *    A Performance Evaluation Over the Internet" (ICC 2004), Paris, June 2004
 + *             |
 + *             V
 + *    +---> STARTUP  ----+
@@ -61,7 +60,9 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 + *    |      +----+      |
 + *    |                  |
 + *    +---- PROBE_RTT <--+
-+ *
+  *
+- * Westwood+ employs end-to-end bandwidth measurement to set cwnd and
+- * ssthresh after packet loss. The probing phase is as the original Reno.
 + * A BBR flow starts in STARTUP, and ramps up its sending rate quickly.
 + * When it estimates the pipe is full, it enters DRAIN to drain the queue.
 + * In steady state a BBR flow only uses PROBE_BW and PROBE_RTT.
@@ -86,11 +87,15 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 + * NOTE: BBR might be used with the fq qdisc ("man tc-fq") with pacing enabled,
 + * otherwise TCP stack falls back to an internal pacing using one high
 + * resolution timer per TCP socket and may use more resources.
-+ */
+  */
+-
+-#include <linux/mm.h>
 +#include <linux/btf.h>
 +#include <linux/btf_ids.h>
-+#include <linux/module.h>
-+#include <net/tcp.h>
+ #include <linux/module.h>
+-#include <linux/skbuff.h>
+-#include <linux/inet_diag.h>
+ #include <net/tcp.h>
 +#include <linux/inet_diag.h>
 +#include <linux/inet.h>
 +#include <linux/random.h>
@@ -107,15 +112,31 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +
 +#define BBR_SCALE 8	/* scaling factor for fractions in BBR (e.g. gains) */
 +#define BBR_UNIT (1 << BBR_SCALE)
-+
+ 
+-/* TCP Westwood structure */
+-struct westwood {
+-	u32    bw_ns_est;        /* first bandwidth estimation..not too smoothed 8) */
+-	u32    bw_est;           /* bandwidth estimate */
+-	u32    rtt_win_sx;       /* here starts a new evaluation... */
+-	u32    bk;
+-	u32    snd_una;          /* used for evaluating the number of acked bytes */
+-	u32    cumul_ack;
+-	u32    accounted;
+-	u32    rtt;
+-	u32    rtt_min;          /* minimum observed RTT */
+-	u8     first_ack;        /* flag which infers that this is the first ack */
+-	u8     reset_rtt_min;    /* Reset RTT min to next RTT sample*/
 +/* BBR has the following modes for deciding how fast to send: */
 +enum bbrm_mode {
 +	BBR_STARTUP,	/* ramp up sending rate rapidly to fill pipe */
 +	BBR_DRAIN,	/* drain any queue created during startup */
 +	BBR_PROBE_BW,	/* discover, share bw: pace around estimated bw */
 +	BBR_PROBE_RTT,	/* cut inflight to min to probe min_rtt */
-+};
-+
+ };
+ 
+-/* TCP Westwood functions and constants */
+-#define TCP_WESTWOOD_RTT_MIN   (HZ/20)	/* 50ms */
+-#define TCP_WESTWOOD_INIT_RTT  (20*HZ)	/* maybe too conservative?! */
 +/* BBR congestion control block */
 +struct bbr {
 +	u32	min_rtt_us;	        /* min RTT in min_rtt_win_sec window */
@@ -198,11 +219,22 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +};
 +/* Randomize the starting gain cycling phase over N phases: */
 +static const u32 bbrm_cycle_rand = 7;
-+
+ 
+-/*
+- * @tcp_westwood_create
+- * This function initializes fields used in TCP Westwood+,
+- * it is called after the initial SYN, so the sequence numbers
+- * are correct but new passive connections we have no
+- * information about RTTmin at this time so we simply set it to
+- * TCP_WESTWOOD_INIT_RTT. This value was chosen to be too conservative
+- * since in this way we're sure it will be updated in a consistent
+- * way as soon as possible. It will reasonably happen within the first
+- * RTT period of the connection lifetime.
 +/* Try to keep at least this many packets in flight, if things go smoothly. For
 + * smooth functioning, a sliding window protocol ACKing every other packet
 + * needs at least 4 packets in flight:
-+ */
+  */
+-static void tcp_westwood_init(struct sock *sk)
 +static const u32 bbrm_cwnd_min_target = 4;
 +
 +/* To estimate if BBR_STARTUP mode (i.e. high_gain) has filled pipe... */
@@ -252,28 +284,52 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +
 +/* Return the estimated bandwidth of the path, in pkts/uS << BW_SCALE. */
 +static u32 bbrm_bw(const struct sock *sk)
-+{
+ {
+-	struct westwood *w = inet_csk_ca(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
-+
+ 
+-	w->bk = 0;
+-	w->bw_ns_est = 0;
+-	w->bw_est = 0;
+-	w->accounted = 0;
+-	w->cumul_ack = 0;
+-	w->reset_rtt_min = 1;
+-	w->rtt_min = w->rtt = TCP_WESTWOOD_INIT_RTT;
+-	w->rtt_win_sx = tcp_jiffies32;
+-	w->snd_una = tcp_sk(sk)->snd_una;
+-	w->first_ack = 1;
 +	return bbr->lt_use_bw ? bbr->lt_bw : bbrm_max_bw(sk);
-+}
-+
+ }
+ 
+-/*
+- * @westwood_do_filter
+- * Low-pass filter. Implemented using constant coefficients.
 +/* Return maximum extra acked in past k-2k round trips,
 + * where k = bbrm_extra_acked_win_rtts.
-+ */
+  */
+-static inline u32 westwood_do_filter(u32 a, u32 b)
 +static u16 bbrm_extra_acked(const struct sock *sk)
-+{
+ {
+-	return ((7 * a) + b) >> 3;
 +	struct bbr *bbr = inet_csk_ca(sk);
 +
 +	return max(bbr->extra_acked[0], bbr->extra_acked[1]);
-+}
-+
+ }
+ 
+-static void westwood_filter(struct westwood *w, u32 delta)
 +/* Return rate in bytes per second, optionally with a gain.
 + * The order here is chosen carefully to avoid overflow of u64. This should
 + * work for input rates of up to 2.9Tbit/sec and gain of 2.89x.
 + */
 +static u64 bbrm_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
-+{
+ {
+-	/* If the filter is empty fill it with the first sample of bandwidth  */
+-	if (w->bw_ns_est == 0 && w->bw_est == 0) {
+-		w->bw_ns_est = w->bk / delta;
+-		w->bw_est = w->bw_ns_est;
+-	} else {
+-		w->bw_ns_est = westwood_do_filter(w->bw_ns_est, w->bk / delta);
+-		w->bw_est = westwood_do_filter(w->bw_est, w->bw_ns_est);
 +	unsigned int mss = tcp_sk(sk)->mss_cache;
 +
 +	rate *= mss;
@@ -306,7 +362,7 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		bbr->has_seen_rtt = 1;
 +	} else {			 /* no RTT sample yet */
 +		rtt_us = USEC_PER_MSEC;	 /* use nominal default RTT */
-+	}
+ 	}
 +	bw = (u64)tcp_snd_cwnd(tp) * BW_UNIT;
 +	do_div(bw, rtt_us);
 +	sk->sk_pacing_rate = bbrm_bw_to_pacing_rate(sk, bw, bbrm_high_gain);
@@ -329,25 +385,38 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +static u32 bbrm_min_tso_segs(struct sock *sk)
 +{
 +	return sk->sk_pacing_rate < (bbrm_min_tso_rate >> 3) ? 1 : 2;
-+}
-+
+ }
+ 
+-/*
+- * @westwood_pkts_acked
+- * Called after processing group of packets.
+- * but all westwood needs is the last sample of srtt.
 +/* Return the number of segments BBR would like in a TSO/GSO skb, given
 + * a particular max gso size as a constraint.
-+ */
+  */
+-static void tcp_westwood_pkts_acked(struct sock *sk,
+-				    const struct ack_sample *sample)
 +static u32 bbrm_tso_segs_generic(struct sock *sk, unsigned int mss_now,
 +				u32 gso_max_size)
-+{
+ {
+-	struct westwood *w = inet_csk_ca(sk);
 +	u32 segs;
 +	u64 bytes;
-+
+ 
+-	if (sample->rtt_us > 0)
+-		w->rtt = usecs_to_jiffies(sample->rtt_us);
 +	/* Budget a TSO/GSO burst size allowance based on bw (pacing_rate). */
 +	bytes = sk->sk_pacing_rate >> sk->sk_pacing_shift;
 +
 +	bytes = min_t(u32, bytes, gso_max_size - 1 - MAX_TCP_HEADER);
 +	segs = max_t(u32, bytes / mss_now, bbrm_min_tso_segs(sk));
 +	return segs;
-+}
-+
+ }
+ 
+-/*
+- * @westwood_update_window
+- * It updates RTT evaluation window if it is the right moment to do
+- * it. If so it calls filter for evaluating bandwidth.
 +/* Custom tcp_tso_autosize() for BBR, used at transmit time to cap skb size. */
 +static u32  bbrm_tso_segs(struct sock *sk, unsigned int mss_now)
 +{
@@ -401,9 +470,12 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 + * builds a smaller queue, it becomes more vulnerable to noise in RTT
 + * measurements (e.g., delayed ACKs or other ACK compression effects). This
 + * noise may cause BBR to under-estimate the rate.
-+ */
+  */
+-static void westwood_update_window(struct sock *sk)
 +static u32 bbrm_bdp(struct sock *sk, u32 bw, int gain)
-+{
+ {
+-	struct westwood *w = inet_csk_ca(sk);
+-	s32 delta = tcp_jiffies32 - w->rtt_win_sx;
 +	struct bbr *bbr = inet_csk_ca(sk);
 +	u32 bdp;
 +	u64 w;
@@ -416,12 +488,18 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	 */
 +	if (unlikely(bbr->min_rtt_us == ~0U))	 /* no valid RTT samples yet? */
 +		return TCP_INIT_CWND;  /* be safe: cap at default initial cwnd*/
-+
+ 
+-	/* Initialize w->snd_una with the first acked sequence number in order
+-	 * to fix mismatch between tp->snd_una and w->snd_una for the first
+-	 * bandwidth sample
 +	w = (u64)bw * bbr->min_rtt_us;
 +
 +	/* Apply a gain to the given value, remove the BW_SCALE shift, and
 +	 * round the value up to avoid a negative feedback loop.
-+	 */
+ 	 */
+-	if (w->first_ack) {
+-		w->snd_una = tcp_sk(sk)->snd_una;
+-		w->first_ack = 0;
 +	bdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
 +
 +	return bdp;
@@ -509,8 +587,16 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		aggr_cwnd = (bbrm_extra_acked_gain * bbrm_extra_acked(sk))
 +			     >> BBR_SCALE;
 +		aggr_cwnd = min(aggr_cwnd, max_aggr_cwnd);
-+	}
-+
+ 	}
+ 
+-	/*
+-	 * See if a RTT-window has passed.
+-	 * Be careful since if RTT is less than
+-	 * 50ms we don't filter but we continue 'building the sample'.
+-	 * This minimum limit was chosen since an estimation on small
+-	 * time intervals is better to avoid...
+-	 * Obviously on a LAN we reasonably will always have
+-	 * right_bound = left_bound + WESTWOOD_RTT_MIN
 +	return aggr_cwnd;
 +}
 +
@@ -533,7 +619,9 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	/* An ACK for P pkts should release at most 2*P packets. We do this
 +	 * in two steps. First, here we deduct the number of lost packets.
 +	 * Then, in bbrm_set_cwnd() we slow start up toward the target cwnd.
-+	 */
+ 	 */
+-	if (w->rtt && delta > max_t(u32, w->rtt, TCP_WESTWOOD_RTT_MIN)) {
+-		westwood_filter(w, delta);
 +	if (rs->losses > 0)
 +		cwnd = max_t(s32, cwnd - rs->losses, 1);
 +
@@ -549,21 +637,29 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		bbr->packet_conservation = 0;
 +	}
 +	bbr->prev_ca_state = state;
-+
+ 
+-		w->bk = 0;
+-		w->rtt_win_sx = tcp_jiffies32;
 +	if (bbr->packet_conservation) {
 +		*new_cwnd = max(cwnd, tcp_packets_in_flight(tp) + acked);
 +		return true;	/* yes, using packet conservation */
-+	}
+ 	}
 +	*new_cwnd = cwnd;
 +	return false;
-+}
-+
+ }
+ 
+-static inline void update_rtt_min(struct westwood *w)
 +/* Slow-start up toward target cwnd (if bw estimate is growing, or packet loss
 + * has drawn us down below target), or snap down to target if we're above it.
 + */
 +static void bbrm_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 +			 u32 acked, u32 bw, int gain)
-+{
+ {
+-	if (w->reset_rtt_min) {
+-		w->rtt_min = w->rtt;
+-		w->reset_rtt_min = 0;
+-	} else
+-		w->rtt_min = min(w->rtt, w->rtt_min);
 +	struct tcp_sock *tp = tcp_sk(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
 +	u32 cwnd = tcp_snd_cwnd(tp), target_cwnd = 0;
@@ -593,12 +689,21 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));	/* apply global cap */
 +	if (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
 +		tcp_snd_cwnd_set(tp, min(tcp_snd_cwnd(tp), bbrm_cwnd_min_target));
-+}
-+
+ }
+ 
+-/*
+- * @westwood_fast_bw
+- * It is called when we are in fast path. In particular it is called when
+- * header prediction is successful. In such case in fact update is
+- * straight forward and doesn't need any particular care.
+- */
+-static inline void westwood_fast_bw(struct sock *sk)
 +/* End cycle phase if it's time and/or we hit the phase's in-flight target. */
 +static bool bbrm_is_next_cycle_phase(struct sock *sk,
 +				    const struct rate_sample *rs)
-+{
+ {
+-	const struct tcp_sock *tp = tcp_sk(sk);
+-	struct westwood *w = inet_csk_ca(sk);
 +	struct tcp_sock *tp = tcp_sk(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
 +	bool is_full_length =
@@ -611,10 +716,14 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	 */
 +	if (bbr->pacing_gain == BBR_UNIT)
 +		return is_full_length;		/* just use wall clock time */
-+
+ 
+-	westwood_update_window(sk);
 +	inflight = bbrm_packets_in_net_at_edt(sk, rs->prior_in_flight);
 +	bw = bbrm_max_bw(sk);
-+
+ 
+-	w->bk += tp->snd_una - w->snd_una;
+-	w->snd_una = tp->snd_una;
+-	update_rtt_min(w);
 +	/* A pacing_gain > 1.0 probes for bw by trying to raise inflight to at
 +	 * least pacing_gain*BDP; this may take more than min_rtt if min_rtt is
 +	 * small (e.g. on a LAN). We do not persist if packets are lost, since
@@ -631,8 +740,12 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	 */
 +	return is_full_length ||
 +		inflight <= bbrm_inflight(sk, bw, BBR_UNIT);
-+}
-+
+ }
+ 
+-/*
+- * @westwood_acked_count
+- * This function evaluates cumul_ack for evaluating bk in case of
+- * delayed or partial acks.
 +static void bbrm_advance_cycle_phase(struct sock *sk)
 +{
 +	struct tcp_sock *tp = tcp_sk(sk);
@@ -729,9 +842,12 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 + * estimate that we're policed if we see 2 consecutive sampling intervals with
 + * consistent throughput and high packet loss. If we think we're being policed,
 + * set lt_bw to the "long-term" average delivery rate from those 2 intervals.
-+ */
+  */
+-static inline u32 westwood_acked_count(struct sock *sk)
 +static void bbrm_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
-+{
+ {
+-	const struct tcp_sock *tp = tcp_sk(sk);
+-	struct westwood *w = inet_csk_ca(sk);
 +	struct tcp_sock *tp = tcp_sk(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
 +	u32 lost, delivered;
@@ -763,7 +879,8 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		bbrm_reset_lt_bw_sampling(sk);
 +		return;
 +	}
-+
+ 
+-	w->cumul_ack = tp->snd_una - w->snd_una;
 +	if (bbr->round_start)
 +		bbr->lt_rtt_cnt++;	/* count round trips in this interval */
 +	if (bbr->lt_rtt_cnt < bbrm_lt_intvl_min_rtts)
@@ -772,11 +889,16 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		bbrm_reset_lt_bw_sampling(sk);  /* interval is too long */
 +		return;
 +	}
-+
+ 
+-	/* If cumul_ack is 0 this is a dupack since it's not moving
+-	 * tp->snd_una.
 +	/* End sampling interval when a packet is lost, so we estimate the
 +	 * policer tokens were exhausted. Stopping the sampling before the
 +	 * tokens are exhausted under-estimates the policed rate.
-+	 */
+ 	 */
+-	if (!w->cumul_ack) {
+-		w->accounted += tp->mss_cache;
+-		w->cumul_ack = tp->mss_cache;
 +	if (!rs->losses)
 +		return;
 +
@@ -795,13 +917,22 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	if (t >= ~0U / USEC_PER_MSEC) {
 +		bbrm_reset_lt_bw_sampling(sk);  /* interval too long; reset */
 +		return;
-+	}
+ 	}
 +	t *= USEC_PER_MSEC;
 +	bw = (u64)delivered * BW_UNIT;
 +	do_div(bw, t);
 +	bbrm_lt_bw_interval_done(sk, bw);
 +}
-+
+ 
+-	if (w->cumul_ack > tp->mss_cache) {
+-		/* Partial or delayed ack */
+-		if (w->accounted >= w->cumul_ack) {
+-			w->accounted -= w->cumul_ack;
+-			w->cumul_ack = tp->mss_cache;
+-		} else {
+-			w->cumul_ack -= w->accounted;
+-			w->accounted = 0;
+-		}
 +/* Estimate the bandwidth based on how fast packets are delivered */
 +static void bbrm_update_bw(struct sock *sk, const struct rate_sample *rs)
 +{
@@ -819,10 +950,12 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		bbr->rtt_cnt++;
 +		bbr->round_start = 1;
 +		bbr->packet_conservation = 0;
-+	}
-+
+ 	}
+ 
+-	w->snd_una = tp->snd_una;
 +	bbrm_lt_bw_sampling(sk, rs);
-+
+ 
+-	return w->cumul_ack;
 +	/* Divide delivered by the interval to find a (lower bound) bottleneck
 +	 * bandwidth sample. Delivered is in packets and interval_us in uS and
 +	 * ratio will be <<1 for most connections. So delivered is first scaled.
@@ -844,8 +977,13 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		/* Incorporate new sample into our max bw filter. */
 +		minmax_running_max(&bbr->bw, bbrm_bw_rtts, bbr->rtt_cnt, bw);
 +	}
-+}
-+
+ }
+ 
+-/*
+- * TCP Westwood
+- * Here limit is evaluated as Bw estimation*RTTmin (for obtaining it
+- * in packets we use mss_cache). Rttmin is guaranteed to be >= 2
+- * so avoids ever returning 0.
 +/* Estimates the windowed max degree of ack aggregation.
 + * This is used to provision extra in-flight data to keep sending during
 + * inter-ACK silences.
@@ -858,10 +996,13 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 + * Max extra_acked is clamped by cwnd and bw * bbrm_extra_acked_max_us (100 ms).
 + * Max filter is an approximate sliding window of 5-10 (packet timed) round
 + * trips.
-+ */
+  */
+-static u32 tcp_westwood_bw_rttmin(const struct sock *sk)
 +static void bbrm_update_ack_aggregation(struct sock *sk,
 +				       const struct rate_sample *rs)
-+{
+ {
+-	const struct tcp_sock *tp = tcp_sk(sk);
+-	const struct westwood *w = inet_csk_ca(sk);
 +	u32 epoch_us, expected_acked, extra_acked;
 +	struct bbr *bbr = inet_csk_ca(sk);
 +	struct tcp_sock *tp = tcp_sk(sk);
@@ -897,7 +1038,8 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		bbr->ack_epoch_mstamp = tp->delivered_mstamp;
 +		expected_acked = 0;
 +	}
-+
+ 
+-	return max_t(u32, (w->bw_est * w->rtt_min) / tp->mss_cache, 2);
 +	/* Compute excess data delivered, beyond what was expected. */
 +	bbr->ack_epoch_acked = min_t(u32, 0xFFFFF,
 +				     bbr->ack_epoch_acked + rs->acked_sacked);
@@ -905,8 +1047,9 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	extra_acked = min(extra_acked, tcp_snd_cwnd(tp));
 +	if (extra_acked > bbr->extra_acked[bbr->extra_acked_win_idx])
 +		bbr->extra_acked[bbr->extra_acked_win_idx] = extra_acked;
-+}
-+
+ }
+ 
+-static void tcp_westwood_ack(struct sock *sk, u32 ack_flags)
 +/* Estimate when the pipe is full, using the change in delivery rate: BBR
 + * estimates that STARTUP filled the pipe if the estimated bw hasn't changed by
 + * at least bbrm_full_bw_thresh (25%) after bbrm_full_bw_cnt (3) non-app-limited
@@ -917,19 +1060,24 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 + */
 +static void bbrm_check_full_bw_reached(struct sock *sk,
 +				      const struct rate_sample *rs)
-+{
+ {
+-	if (ack_flags & CA_ACK_SLOWPATH) {
+-		struct westwood *w = inet_csk_ca(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
 +	u32 bw_thresh;
-+
+ 
+-		westwood_update_window(sk);
+-		w->bk += westwood_acked_count(sk);
 +	if (bbrm_full_bw_reached(sk) || !bbr->round_start || rs->is_app_limited)
 +		return;
-+
+ 
+-		update_rtt_min(w);
 +	bw_thresh = (u64)bbr->full_bw * bbrm_full_bw_thresh >> BBR_SCALE;
 +	if (bbrm_max_bw(sk) >= bw_thresh) {
 +		bbr->full_bw = bbrm_max_bw(sk);
 +		bbr->full_bw_cnt = 0;
-+		return;
-+	}
+ 		return;
+ 	}
 +	++bbr->full_bw_cnt;
 +	bbr->full_bw_reached = bbr->full_bw_cnt >= bbrm_full_bw_cnt;
 +}
@@ -949,7 +1097,8 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	    bbrm_inflight(sk, bbrm_max_bw(sk), BBR_UNIT))
 +		bbrm_reset_probe_bw_mode(sk);  /* we estimate queue is drained */
 +}
-+
+ 
+-	westwood_fast_bw(sk);
 +static void bbrm_check_probe_rtt_done(struct sock *sk)
 +{
 +	struct tcp_sock *tp = tcp_sk(sk);
@@ -962,8 +1111,9 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	bbr->min_rtt_stamp = tcp_jiffies32;  /* wait a while until PROBE_RTT */
 +	tcp_snd_cwnd_set(tp, max(tcp_snd_cwnd(tp), bbr->prior_cwnd));
 +	bbrm_reset_mode(sk);
-+}
-+
+ }
+ 
+-static void tcp_westwood_event(struct sock *sk, enum tcp_ca_event event)
 +/* The goal of PROBE_RTT mode is to have BBR flows cooperatively and
 + * periodically drain the bottleneck queue, to converge to measure the true
 + * min_rtt (unloaded propagation delay). This allows the flows to keep queues
@@ -984,11 +1134,16 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 + * these min RTT measurements opportunistically with our min_rtt filter. :-)
 + */
 +static void bbrm_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
-+{
-+	struct tcp_sock *tp = tcp_sk(sk);
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+-	struct westwood *w = inet_csk_ca(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
 +	bool filter_expired;
-+
+ 
+-	switch (event) {
+-	case CA_EVENT_COMPLETE_CWR:
+-		tp->snd_ssthresh = tcp_westwood_bw_rttmin(sk);
+-		tcp_snd_cwnd_set(tp, tp->snd_ssthresh);
 +	/* Track min RTT seen in the min_rtt_win_sec filter window: */
 +	filter_expired = after(tcp_jiffies32,
 +			       bbr->min_rtt_stamp + bbrm_min_rtt_win_sec * HZ);
@@ -1047,17 +1202,33 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +				    BBR_UNIT :
 +				    bbrm_pacing_gain[bbr->cycle_idx]);
 +		bbr->cwnd_gain	 = bbrm_cwnd_gain;
-+		break;
+ 		break;
+-	case CA_EVENT_LOSS:
+-		tp->snd_ssthresh = tcp_westwood_bw_rttmin(sk);
+-		/* Update RTT_min when next ack arrives */
+-		w->reset_rtt_min = 1;
 +	case BBR_PROBE_RTT:
 +		bbr->pacing_gain = BBR_UNIT;
 +		bbr->cwnd_gain	 = BBR_UNIT;
-+		break;
-+	default:
+ 		break;
+ 	default:
+-		/* don't care */
 +		WARN_ONCE(1, "BBR bad mode: %u\n", bbr->mode);
-+		break;
-+	}
-+}
-+
+ 		break;
+ 	}
+ }
+ 
+-/* Extract info for Tcp socket info provided via netlink. */
+-static size_t tcp_westwood_info(struct sock *sk, u32 ext, int *attr,
+-				union tcp_cc_info *info)
+-{
+-	const struct westwood *ca = inet_csk_ca(sk);
+-
+-	if (ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
+-		info->vegas.tcpv_enabled = 1;
+-		info->vegas.tcpv_rttcnt	= 0;
+-		info->vegas.tcpv_rtt	= jiffies_to_usecs(ca->rtt);
+-		info->vegas.tcpv_minrtt	= jiffies_to_usecs(ca->rtt_min);
 +static void bbrm_update_model(struct sock *sk, const struct rate_sample *rs)
 +{
 +	bbrm_update_bw(sk, rs);
@@ -1135,7 +1306,9 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +static u32 bbrm_undo_cwnd(struct sock *sk)
 +{
 +	struct bbr *bbr = inet_csk_ca(sk);
-+
+ 
+-		*attr = INET_DIAG_VEGASINFO;
+-		return sizeof(struct tcpvegas_info);
 +	bbr->full_bw = 0;   /* spurious slow-down; reset full pipe detection */
 +	bbr->full_bw_cnt = 0;
 +	bbrm_reset_lt_bw_sampling(sk);
@@ -1167,17 +1340,26 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +		info->bbr.bbr_cwnd_gain		= bbr->cwnd_gain;
 +		*attr = INET_DIAG_BBRINFO;
 +		return sizeof(info->bbr);
-+	}
-+	return 0;
-+}
-+
+ 	}
+ 	return 0;
+ }
+ 
+-static struct tcp_congestion_ops tcp_westwood __read_mostly = {
+-	.init		= tcp_westwood_init,
+-	.ssthresh	= tcp_reno_ssthresh,
+-	.cong_avoid	= tcp_reno_cong_avoid,
+-	.undo_cwnd      = tcp_reno_undo_cwnd,
+-	.cwnd_event	= tcp_westwood_event,
+-	.in_ack_event	= tcp_westwood_ack,
+-	.get_info	= tcp_westwood_info,
+-	.pkts_acked	= tcp_westwood_pkts_acked,
 +static void bbrm_set_state(struct sock *sk, u8 new_state)
 +{
 +	struct bbr *bbr = inet_csk_ca(sk);
 +
 +	if (new_state == TCP_CA_Loss) {
 +		struct rate_sample rs = { .losses = 1 };
-+
+ 
 +		bbr->prev_ca_state = TCP_CA_Loss;
 +		bbr->full_bw = 0;
 +		bbr->round_start = 1;	/* treat RTO like end of a round */
@@ -1187,8 +1369,9 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +
 +static struct tcp_congestion_ops tcp_bbrm_cong_ops __read_mostly = {
 +	.flags		= TCP_CONG_NON_RESTRICTED,
-+	.name		= "bbrm",
-+	.owner		= THIS_MODULE,
++	.name		= "westwood",
+ 	.owner		= THIS_MODULE,
+-	.name		= "westwood"
 +	.init		= bbrm_init,
 +	.cong_control	= bbrm_main,
 +	.sndbuf_expand	= bbrm_sndbuf_expand,
@@ -1198,8 +1381,9 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	.tso_segs	= bbrm_tso_segs,
 +	.get_info	= bbrm_get_info,
 +	.set_state	= bbrm_set_state,
-+};
-+
+ };
+ 
+-static int __init tcp_westwood_register(void)
 +BTF_SET8_START(tcp_bbrm_check_kfunc_ids)
 +#ifdef CONFIG_X86
 +#ifdef CONFIG_DYNAMIC_FTRACE
@@ -1221,7 +1405,9 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +};
 +
 +static int __init bbrm_register(void)
-+{
+ {
+-	BUILD_BUG_ON(sizeof(struct westwood) > ICSK_CA_PRIV_SIZE);
+-	return tcp_register_congestion_control(&tcp_westwood);
 +	int ret;
 +
 +	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
@@ -1230,16 +1416,23 @@ diff -uprN linux-6.9.9/net/ipv4/tcp_bbrm.c linux-6.9.9-mod/net/ipv4/tcp_bbrm.c
 +	if (ret < 0)
 +		return ret;
 +	return tcp_register_congestion_control(&tcp_bbrm_cong_ops);
-+}
-+
+ }
+ 
+-static void __exit tcp_westwood_unregister(void)
 +static void __exit bbrm_unregister(void)
-+{
+ {
+-	tcp_unregister_congestion_control(&tcp_westwood);
 +	tcp_unregister_congestion_control(&tcp_bbrm_cong_ops);
-+}
-+
+ }
+ 
+-module_init(tcp_westwood_register);
+-module_exit(tcp_westwood_unregister);
 +module_init(bbrm_register);
 +module_exit(bbrm_unregister);
-+
+ 
+-MODULE_AUTHOR("Stephen Hemminger, Angelo Dell'Aera");
+-MODULE_LICENSE("GPL");
+-MODULE_DESCRIPTION("TCP Westwood+");
 +MODULE_AUTHOR("Van Jacobson <vanj@google.com>");
 +MODULE_AUTHOR("Neal Cardwell <ncardwell@google.com>");
 +MODULE_AUTHOR("Yuchung Cheng <ycheng@google.com>");
