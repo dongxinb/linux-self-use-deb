@@ -80,6 +80,7 @@ jobs:
           patch -Np1 -i ../patches/tcp-brutal/0002-net-tcp_brutal-use-div_u64-to-let-it-build-on-32-bit.patch
           patch -Np1 -i ../patches/bcm-fullcone/0001-netfilter-nat-add-brcm-fullcone-support.patch
           patch -Np1 -i ../patches/bcm-fullcone/0002-netfilter-nat-add-brcm-fullcone-nft-support.patch
+          patch -Np1 -i ../patches/tcp_bbr.patch
 
   setup_config:
     name: Setup config
@@ -89,12 +90,12 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        config: [generic, cloud]
+        config: [cloud]
     steps:
       - working-directory: linux-${{ env.KERNEL_STABLE_VER }}
         run: |
           scripts/config --file ../config.${{ matrix.config }} \
-                         --set-str LOCALVERSION "-egoist-${{ matrix.config }}"
+                         --set-str LOCALVERSION "-fx-param-${{ matrix.config }}"
           # Clang FULL-LTO
           scripts/config --file ../config.${{ matrix.config }} \
                          -d LTO_NONE \
@@ -175,7 +176,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        config: [generic, cloud]
+        config: [cloud]
     steps:
       - working-directory: linux-${{ env.KERNEL_STABLE_VER }}
         env:
@@ -206,7 +207,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        config: [generic, cloud]
+        config: [cloud]
     steps:
       - uses: actions/upload-artifact@v4
         with:
@@ -221,14 +222,14 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        config: [generic, cloud]
+        config: [cloud]
     steps:
       - uses: actions/upload-artifact@v4
         with:
           name: deb.${{ matrix.config }}
           path: |
-            linux-image-${{ env.KERNEL_STABLE_VER }}-egoist-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
-            linux-headers-${{ env.KERNEL_STABLE_VER }}-egoist-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
+            linux-image-${{ env.KERNEL_STABLE_VER }}-fx-param-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
+            linux-headers-${{ env.KERNEL_STABLE_VER }}-fx-param-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
             linux-libc-dev_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
           compression-level: 0
 
@@ -239,15 +240,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        config: [generic, cloud]
+        config: [cloud]
     steps:
       - if: ${{ github.event.inputs.release != 'none' }}
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
           artifacts: |
-            linux-image-${{ env.KERNEL_STABLE_VER }}-egoist-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
-            linux-headers-${{ env.KERNEL_STABLE_VER }}-egoist-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
+            linux-image-${{ env.KERNEL_STABLE_VER }}-fx-param-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
+            linux-headers-${{ env.KERNEL_STABLE_VER }}-fx-param-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
             linux-libc-dev_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
           prerelease: ${{ github.event.inputs.release == 'pre-release' }}
           makeLatest: ${{ github.event.inputs.release == 'release' }}
