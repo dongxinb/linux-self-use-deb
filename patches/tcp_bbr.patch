@@ -1,6 +1,8 @@
+Binary files a/.DS_Store and b/.DS_Store differ
+Binary files a/net/.DS_Store and b/net/.DS_Store differ
 diff -ruN a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
---- a/net/ipv4/tcp_bbr.c	2025-01-20 19:46:39.616328006 +0800
-+++ b/net/ipv4/tcp_bbr.c	2025-01-20 19:46:56.781318701 +0800
+--- a/net/ipv4/tcp_bbr.c	2025-01-22 14:15:12
++++ b/net/ipv4/tcp_bbr.c	2025-01-25 00:39:10
 @@ -108,13 +108,13 @@
  	u32	lt_last_delivered;   /* LT intvl start: tp->delivered */
  	u32	lt_last_stamp;	     /* LT intvl start: tp->delivered_mstamp */
@@ -18,30 +20,53 @@ diff -ruN a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
  	u32	prior_cwnd;	/* prior cwnd upon entering loss recovery */
  	u32	full_bw;	/* recent bw, to estimate if pipe is full */
  
-@@ -130,13 +130,13 @@
+@@ -129,14 +129,36 @@
+ 
  #define CYCLE_LEN	8	/* number of phases in a pacing gain cycle */
  
++struct minmax_rtt_sample {
++	u32 t;	// time measurement was taken
++	u32 v;	// value measured
++};
++
++struct minmax_rtt {
++	struct minmax_rtt_sample s[3];
++};
++
++
++struct minmax_rtt min_rtt_in_10_rounds;
++
++static u32 min_rtt_for_adjusting;  
++static bool adjusting_mode_is_on  =  0;    
++static u32 required_rtt_cnt = 0;   
++static u32 min_rtt_in_10_rounds_value;
++
++static const int required_rtt_win = CYCLE_LEN + 2; 
++static const int lesser_factor_0_8 = 0.8 * BBR_UNIT;
++static const int lesser_factor_0_9 = 0.95 * BBR_UNIT;
++
++
  /* Window length of bw filter (in rounds): */
 -static const int bbr_bw_rtts = CYCLE_LEN + 2;
 +static int bbr_bw_rtts = CYCLE_LEN + 2;
  /* Window length of min_rtt filter (in sec): */
 -static const u32 bbr_min_rtt_win_sec = 10;
-+static u32 bbr_min_rtt_win_sec = 20;
++static u32 bbr_min_rtt_win_sec = 10;
  /* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
 -static const u32 bbr_probe_rtt_mode_ms = 200;
-+static u32 bbr_probe_rtt_mode_ms = 100;
++static u32 bbr_probe_rtt_mode_ms = 200;
  /* Skip TSO below the following bandwidth (bits/sec): */
 -static const int bbr_min_tso_rate = 1200000;
 +static int bbr_min_tso_rate = 1200000;
  
  /* Pace at ~1% below estimated bw, on average, to reduce queue at bottleneck.
   * In order to help drive the network toward lower queues and low latency while
-@@ -144,62 +144,85 @@
+@@ -144,63 +166,147 @@
   * lower than the estimated bandwidth. This is an important aspect of the
   * design.
   */
 -static const int bbr_pacing_margin_percent = 1;
-+static int bbr_pacing_margin_percent = 5;
++static int bbr_pacing_margin_percent = 1;
  
  /* We use a high_gain value of 2/ln(2) because it's the smallest pacing gain
   * that will allow a smoothly increasing pacing rate that will double each RTT
@@ -54,21 +79,17 @@ diff -ruN a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
   * the queue created in BBR_STARTUP in a single round:
   */
 -static const int bbr_drain_gain = BBR_UNIT * 1000 / 2885;
-+static int bbr_drain_gain = BBR_UNIT * 1000 / 2885;
++static int bbr_drain_gain = BBR_UNIT * 1000 / 6000;
  /* The gain for deriving steady-state cwnd tolerates delayed/stretched ACKs: */
 -static const int bbr_cwnd_gain  = BBR_UNIT * 2;
-+static int bbr_cwnd_gain  = BBR_UNIT * 4;
++static int bbr_cwnd_gain  = BBR_UNIT * 2;
  /* The pacing_gain values for the PROBE_BW gain cycle, to discover/share bw: */
 -static const int bbr_pacing_gain[] = {
--	BBR_UNIT * 5 / 4,	/* probe for more available bw */
--	BBR_UNIT * 3 / 4,	/* drain queue and/or yield bw to other flows */
--	BBR_UNIT, BBR_UNIT, BBR_UNIT,	/* cruise at 1.0*bw to utilize pipe, */
--	BBR_UNIT, BBR_UNIT, BBR_UNIT	/* without creating excess queue... */
 +static int bbr_pacing_gain[] = {
-+	BBR_UNIT * 8 / 4,	/* probe for more available bw */
-+	BBR_UNIT * 6 / 4,	/* drain queue and/or yield bw to other flows */
-+	BBR_UNIT * 6 / 4, BBR_UNIT * 5 / 6, BBR_UNIT * 6 / 4,	/* cruise at 1.0*bw to utilize pipe, */
-+	BBR_UNIT * 6 / 4, BBR_UNIT * 5 / 6, BBR_UNIT * 6 / 4	/* without creating excess queue... */
+ 	BBR_UNIT * 5 / 4,	/* probe for more available bw */
+ 	BBR_UNIT * 3 / 4,	/* drain queue and/or yield bw to other flows */
+ 	BBR_UNIT, BBR_UNIT, BBR_UNIT,	/* cruise at 1.0*bw to utilize pipe, */
+ 	BBR_UNIT, BBR_UNIT, BBR_UNIT	/* without creating excess queue... */
  };
  /* Randomize the starting gain cycling phase over N phases: */
 -static const u32 bbr_cycle_rand = 7;
@@ -79,45 +100,46 @@ diff -ruN a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
   * needs at least 4 packets in flight:
   */
 -static const u32 bbr_cwnd_min_target = 4;
-+static u32 bbr_cwnd_min_target = 200;
++static u32 bbr_cwnd_min_target = 4;
  
  /* To estimate if BBR_STARTUP mode (i.e. high_gain) has filled pipe... */
  /* If bw has increased significantly (1.25x), there may be more bw available: */
 -static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;
-+static u32 bbr_full_bw_thresh = BBR_UNIT * 105 / 100;
++static u32 bbr_full_bw_thresh = BBR_UNIT * 5  / 4;
  /* But after 3 rounds w/o significant bw growth, estimate pipe is full: */
 -static const u32 bbr_full_bw_cnt = 3;
-+static u32 bbr_full_bw_cnt = 10;
++static u32 bbr_full_bw_cnt = 3;
  
  /* "long-term" ("LT") bandwidth estimator parameters... */
  /* The minimum number of rounds in an LT bw sampling interval: */
 -static const u32 bbr_lt_intvl_min_rtts = 4;
-+static u32 bbr_lt_intvl_min_rtts = 1;
++static u32 bbr_lt_intvl_min_rtts = 4;
  /* If lost/delivered ratio > 20%, interval is "lossy" and we may be policed: */
 -static const u32 bbr_lt_loss_thresh = 50;
 +static u32 bbr_lt_loss_thresh = 50;
  /* If 2 intervals have a bw ratio <= 1/8, their bw is "consistent": */
 -static const u32 bbr_lt_bw_ratio = BBR_UNIT / 8;
-+static u32 bbr_lt_bw_ratio = BBR_UNIT / 2;
++static u32 bbr_lt_bw_ratio = BBR_UNIT / 8;
  /* If 2 intervals have a bw diff <= 4 Kbit/sec their bw is "consistent": */
 -static const u32 bbr_lt_bw_diff = 4000 / 8;
-+static u32 bbr_lt_bw_diff = 8000 / 8;
++static u32 bbr_lt_bw_diff = 4000 / 8;
  /* If we estimate we're policed, use lt_bw for this many round trips: */
 -static const u32 bbr_lt_bw_max_rtts = 48;
 +static u32 bbr_lt_bw_max_rtts = 48;
  
  /* Gain factor for adding extra_acked to target cwnd: */
 -static const int bbr_extra_acked_gain = BBR_UNIT;
-+static int bbr_extra_acked_gain = BBR_UNIT * 6 / 4;
++static int bbr_extra_acked_gain = BBR_UNIT;
  /* Window length of extra_acked window. */
 -static const u32 bbr_extra_acked_win_rtts = 5;
-+static u32 bbr_extra_acked_win_rtts = 15;
++static u32 bbr_extra_acked_win_rtts = 5;
  /* Max allowed val for ack_epoch_acked, after which sampling epoch is reset */
 -static const u32 bbr_ack_epoch_acked_reset_thresh = 1U << 20;
 +static u32 bbr_ack_epoch_acked_reset_thresh = 1U << 20;
  /* Time period for clamping cwnd increment due to ack aggregation */
 -static const u32 bbr_extra_acked_max_us = 100 * 1000;
-+static u32 bbr_extra_acked_max_us = 25 * 1000;
++static u32 bbr_extra_acked_max_us = 100 * 1000;
+ 
 +
 +module_param(bbr_bw_rtts, int, 0644);
 +module_param(bbr_min_rtt_win_sec, int, 0644);
@@ -141,12 +163,187 @@ diff -ruN a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
 +module_param(bbr_extra_acked_win_rtts, int, 0644);
 +module_param(bbr_ack_epoch_acked_reset_thresh, int, 0644);
 +module_param(bbr_extra_acked_max_us, int, 0644);
- 
++
++
++static inline u32 minmax_rtt_reset(struct minmax_rtt *m, u32 t, u32 meas) 
++{
++	struct minmax_rtt_sample val = { .t = t, .v = meas };
++
++	m->s[2] = m->s[1] = m->s[0] = val;
++	return m->s[0].v;   
++}
++
++static inline void minmax_rtt_reset_2(struct minmax_rtt *m, u32 t, u32 meas)  
++{
++	struct minmax_rtt_sample val = { .t = t, .v = meas };
++
++	m->s[2] = m->s[1] = m->s[0] = val;
++
++}
++
++
++// As time advances, update the 1st, 2nd, and 3rd choices.
++static u32 minmax_rtt_subwin_update(struct minmax_rtt *m, u32 win,
++const struct minmax_rtt_sample *val)     
++{
++	u32 dt = val->t - m->s[0].t;
++
++	if (unlikely(dt > win)) {  
++	       
++		m->s[0] = m->s[1];
++		m->s[1] = m->s[2];
++		m->s[2] = *val;
++		if (unlikely(val->t - m->s[0].t > win)) {    
++			m->s[0] = m->s[1];
++			m->s[1] = m->s[2];
++			m->s[2] = *val;
++		}
++	} else if (unlikely(m->s[1].t == m->s[0].t) && dt > win/4) {
++
++		m->s[2] = m->s[1] = *val;  
++	} else if (unlikely(m->s[2].t == m->s[1].t) && dt > win/2) {  
++		m->s[2] = *val;     
++	}
++	return m->s[0].v;   
++}
++
++
++    
++static u32 minmax_rtt_running_min(struct minmax_rtt *m, u32 win, u32 t, u32 meas)
++{
++	struct minmax_rtt_sample val = { .t = t, .v = meas };
++
++	if (unlikely(val.v <= m->s[0].v) ||	unlikely(val.t - m->s[2].t > win))	 
++		return minmax_rtt_reset(m, t, meas);     
++
++	if (unlikely(val.v <= m->s[1].v))    
++		m->s[2] = m->s[1] = val;      
++	else if (unlikely(val.v <= m->s[2].v)) 
++		m->s[2] = val;
++
++	return minmax_rtt_subwin_update(m, win, &val);
++}
++
  static void bbr_check_probe_rtt_done(struct sock *sk);
  
-@@ -1200,4 +1223,4 @@
+ /* Do we estimate that STARTUP filled the pipe? */
+@@ -379,6 +485,9 @@
+ 	 */
+ 	bdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
+ 
++	if (bbr->mode == BBR_PROBE_BW && gain > BBR_UNIT)
++		bdp += 2;
++
+ 	return bdp;
+ }
+ 
+@@ -558,7 +667,7 @@
+ 	struct bbr *bbr = inet_csk_ca(sk);
+ 	bool is_full_length =
+ 		tcp_stamp_us_delta(tp->delivered_mstamp, bbr->cycle_mstamp) >
+-		bbr->min_rtt_us;
++		min_rtt_for_adjusting;
+ 	u32 inflight, bw;
+ 
+ 	/* The pacing_gain of 1.0 paces at the estimated bw to try to fully
+@@ -578,13 +687,13 @@
+ 	if (bbr->pacing_gain > BBR_UNIT)
+ 		return is_full_length &&
+ 			(rs->losses ||  /* perhaps pacing_gain*BDP won't fit */
+-			 inflight >= bbr_inflight(sk, bw, bbr->pacing_gain));
++			 inflight > bbr_inflight(sk, bw, bbr->pacing_gain));
+ 
+ 	/* A pacing_gain < 1.0 tries to drain extra queue we added if bw
+ 	 * probing didn't find more bw. If inflight falls to match BDP then we
+ 	 * estimate queue is drained; persisting would underutilize the pipe.
+ 	 */
+-	return is_full_length ||
++	return is_full_length &&
+ 		inflight <= bbr_inflight(sk, bw, BBR_UNIT);
+ }
+ 
+@@ -948,10 +1057,15 @@
+ 	filter_expired = after(tcp_jiffies32,
+ 			       bbr->min_rtt_stamp + bbr_min_rtt_win_sec * HZ);
+ 	if (rs->rtt_us >= 0 &&
++	    (rs->rtt_us - bbr->min_rtt_us < 10000 ||
++	     (filter_expired && !rs->is_ack_delayed))) {
++		bbr->min_rtt_stamp = tcp_jiffies32;
++	}
++
++	if (rs->rtt_us >= 0 &&
+ 	    (rs->rtt_us < bbr->min_rtt_us ||
+ 	     (filter_expired && !rs->is_ack_delayed))) {
+ 		bbr->min_rtt_us = rs->rtt_us;
+-		bbr->min_rtt_stamp = tcp_jiffies32;
+ 	}
+ 
+ 	if (bbr_probe_rtt_mode_ms > 0 && filter_expired &&
+@@ -1027,13 +1141,57 @@
+ __bpf_kfunc static void bbr_main(struct sock *sk, const struct rate_sample *rs)
+ {
+ 	struct bbr *bbr = inet_csk_ca(sk);
+-	u32 bw;
++	u64 bw1;
++	u64 bw2;
+ 
+ 	bbr_update_model(sk, rs);
+ 
+-	bw = bbr_bw(sk);
+-	bbr_set_pacing_rate(sk, bw, bbr->pacing_gain);
+-	bbr_set_cwnd(sk, rs, rs->acked_sacked, bw, bbr->cwnd_gain);
++	if (bbr->mode == BBR_PROBE_BW  && bbr ->pacing_gain <= BBR_UNIT && rs->rtt_us >= 0){
++
++		if( 100 * rs->rtt_us <= 105 * bbr->min_rtt_us) {
++			min_rtt_for_adjusting = bbr->min_rtt_us;
++			adjusting_mode_is_on  =  0;     
++			required_rtt_cnt = 0;   
++			min_rtt_in_10_rounds_value = -1;
++			minmax_rtt_reset_2(&min_rtt_in_10_rounds,0, -1);
++		}
++
++		if(100 * rs->rtt_us > 105 * bbr->min_rtt_us){
++			required_rtt_cnt ++;
++			min_rtt_in_10_rounds_value = minmax_rtt_running_min(&min_rtt_in_10_rounds,
++			required_rtt_win, required_rtt_cnt, rs->rtt_us);
++		}
++
++		if( required_rtt_cnt >=  CYCLE_LEN  + 2){
++			adjusting_mode_is_on = 1;
++		}
++
++		if( adjusting_mode_is_on){
++			min_rtt_for_adjusting = min_rtt_in_10_rounds_value;
++		}
++		      
++		if (100 * rs->rtt_us >= 125 * min_rtt_for_adjusting){
++			bw1 = lesser_factor_0_8 * bbr_bw(sk) >> BBR_SCALE;
++		}
++		else if ( !adjusting_mode_is_on &&
++			100 * rs->rtt_us < 125 * min_rtt_for_adjusting && 100 * rs->rtt_us >= 105 * min_rtt_for_adjusting){
++			bw1 =  lesser_factor_0_9 * bbr_bw(sk) >> BBR_SCALE;
++		}
++		else if ( adjusting_mode_is_on &&
++			100 * rs->rtt_us < 125 * min_rtt_for_adjusting && rs->rtt_us >  min_rtt_for_adjusting){      
++			bw1 =  lesser_factor_0_9 * bbr_bw(sk) >> BBR_SCALE;
++		}
++		else
++			bw1 =  bbr_bw(sk);
++	}
++
++	if ((bbr->mode == BBR_STARTUP || bbr->mode == BBR_DRAIN || bbr->mode == BBR_PROBE_RTT || bbr ->pacing_gain > BBR_UNIT || bbr->cycle_idx == 3) && rs->rtt_us >= 0){
++		bw1 =  bbr_bw(sk);
++	}
++
++	bw2 =  bbr_bw(sk);
++	bbr_set_pacing_rate(sk, bw1, bbr->pacing_gain);
++	bbr_set_cwnd(sk, rs, rs->acked_sacked, bw2, bbr->cwnd_gain);
+ }
+ 
+ __bpf_kfunc static void bbr_init(struct sock *sk)
+@@ -1200,4 +1358,4 @@
  MODULE_AUTHOR("Yuchung Cheng <ycheng@google.com>");
  MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
  MODULE_LICENSE("Dual BSD/GPL");
 -MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");
-+MODULE_DESCRIPTION("TCP BBR PARAM (Bottleneck Bandwidth and RTT)");
++MODULE_DESCRIPTION("TCP BBR-R PARAM (Bottleneck Bandwidth and RTT)");

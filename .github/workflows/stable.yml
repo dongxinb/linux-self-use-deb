@@ -94,7 +94,7 @@ jobs:
       - working-directory: linux-${{ env.KERNEL_STABLE_VER }}
         run: |
           scripts/config --file ../config.${{ matrix.config }} \
-                         --set-str LOCALVERSION "-zed-${{ matrix.config }}"
+                         --set-str LOCALVERSION "-zedr-${{ matrix.config }}"
           # Clang FULL-LTO
           scripts/config --file ../config.${{ matrix.config }} \
                          -d LTO_NONE \
@@ -227,8 +227,8 @@ jobs:
         with:
           name: deb.${{ matrix.config }}
           path: |
-            linux-image-${{ env.KERNEL_STABLE_VER }}-zed-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
-            linux-headers-${{ env.KERNEL_STABLE_VER }}-zed-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
+            linux-image-${{ env.KERNEL_STABLE_VER }}-zedr-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
+            linux-headers-${{ env.KERNEL_STABLE_VER }}-zedr-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
             linux-libc-dev_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
           compression-level: 0
 
@@ -246,8 +246,8 @@ jobs:
         with:
           allowUpdates: true
           artifacts: |
-            linux-image-${{ env.KERNEL_STABLE_VER }}-zed-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
-            linux-headers-${{ env.KERNEL_STABLE_VER }}-zed-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
+            linux-image-${{ env.KERNEL_STABLE_VER }}-zedr-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
+            linux-headers-${{ env.KERNEL_STABLE_VER }}-zedr-${{ matrix.config }}_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
             linux-libc-dev_${{ env.KERNEL_STABLE_VER }}-${{ env.PKGVER }}_amd64.deb
           prerelease: ${{ github.event.inputs.release == 'pre-release' }}
           makeLatest: ${{ github.event.inputs.release == 'release' }}
